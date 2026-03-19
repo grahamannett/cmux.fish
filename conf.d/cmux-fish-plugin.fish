@@ -186,6 +186,37 @@ function _cmux_pr_output_indicates_no_pull_request --description "Check if gh er
 end
 
 # ---------------------------------------------------------------------------
+# _cmux_github_repo_slug_for_path -- extract owner/repo from git remote URL.
+# ---------------------------------------------------------------------------
+function _cmux_github_repo_slug_for_path --description "Extract GitHub owner/repo from remote"
+    set -l repo_path $argv[1]
+    test -n "$repo_path"; or return 0
+
+    set -l remote_url (git -C $repo_path remote get-url origin 2>/dev/null)
+    test -n "$remote_url"; or return 0
+
+    set -l path_part ""
+    switch $remote_url
+        case 'git@github.com:*'
+            set path_part (string replace 'git@github.com:' '' -- $remote_url)
+        case 'ssh://git@github.com/*'
+            set path_part (string replace 'ssh://git@github.com/' '' -- $remote_url)
+        case 'https://github.com/*'
+            set path_part (string replace 'https://github.com/' '' -- $remote_url)
+        case 'http://github.com/*'
+            set path_part (string replace 'http://github.com/' '' -- $remote_url)
+        case 'git://github.com/*'
+            set path_part (string replace 'git://github.com/' '' -- $remote_url)
+        case '*'
+            return 0
+    end
+
+    set path_part (string replace -r '\.git$' '' -- $path_part)
+    string match -q '*/*' -- $path_part; or return 0
+    printf '%s\n' $path_part
+end
+
+# ---------------------------------------------------------------------------
 # _cmux_report_pr_for_path -- run gh pr view and send result to cmux.
 # ---------------------------------------------------------------------------
 function _cmux_report_pr_for_path --description "Run gh pr view and send result to app"
@@ -208,6 +239,13 @@ function _cmux_report_pr_for_path --description "Run gh pr view and send result 
         return 0
     end
 
+    # Resolve GitHub repo slug for --repo flag (helps with worktrees/forks).
+    set -l repo_slug (_cmux_github_repo_slug_for_path $repo_path)
+    set -l gh_repo_args
+    if test -n "$repo_slug"
+        set gh_repo_args --repo $repo_slug
+    end
+
     set -l tmpdir $TMPDIR
     if test -z "$tmpdir"
         set tmpdir /tmp
@@ -224,7 +262,8 @@ function _cmux_report_pr_for_path --description "Run gh pr view and send result 
         /bin/rm -f -- $err_file >/dev/null 2>&1; or true
         return 1
     end
-    set gh_output (gh pr view \
+    set gh_output (gh pr view "$branch" \
+        $gh_repo_args \
         --json number,state,url \
         --jq '[.number, .state, .url] | @tsv' \
         2>$err_file)
@@ -236,32 +275,17 @@ function _cmux_report_pr_for_path --description "Run gh pr view and send result 
         /bin/rm -f -- $err_file >/dev/null 2>&1; or true
     end
 
-    if test $gh_status -ne 0
-        if _cmux_pr_output_indicates_no_pull_request "$gh_error"
-            # Retry with explicit branch name -- worktree or implicit-resolution
-            # failures may succeed when branch is named directly.
-            set -l retry_err_file (/usr/bin/mktemp "$tmpdir/cmux-gh-pr-view.XXXXXX" 2>/dev/null)
-            if test -n "$retry_err_file"
-                set gh_output (gh pr view "$branch" \
-                    --json number,state,url \
-                    --jq '[.number, .state, .url] | @tsv' \
-                    2>$retry_err_file)
-                set gh_status $status
-                /bin/rm -f -- $retry_err_file >/dev/null 2>&1; or true
-            end
-            if test $gh_status -ne 0
-                _cmux_clear_pr_for_panel
-                return 0
-            end
-        else
-            # Preserve last-known PR badge on transient failures; retry next poll.
-            return 1
+    if test $gh_status -ne 0; or test -z "$gh_output"
+        if test $gh_status -eq 0 -a -z "$gh_output"
+            _cmux_clear_pr_for_panel
+            return 0
         end
-    end
-
-    if test -z "$gh_output"
-        _cmux_clear_pr_for_panel
-        return 0
+        if _cmux_pr_output_indicates_no_pull_request "$gh_error"
+            _cmux_clear_pr_for_panel
+            return 0
+        end
+        # Preserve last-known PR badge on transient failures; retry next poll.
+        return 1
     end
 
     set -l parts (string split \t -- $gh_output)
@@ -285,7 +309,8 @@ function _cmux_report_pr_for_path --description "Run gh pr view and send result 
             return 1
     end
 
-    _cmux_send "report_pr $number $url $status_opt --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
+    set -l quoted_branch (string replace -a '"' '\\"' -- $branch)
+    _cmux_send "report_pr $number $url $status_opt --branch=\"$quoted_branch\" --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
 end
 
 # ---------------------------------------------------------------------------
